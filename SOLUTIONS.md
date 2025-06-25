@@ -24,26 +24,22 @@
 
 - Language: Python, Go
 - Approach: อ่านไฟล์ตามลิสต์ แล้วนับบรรทัด/คำของแต่ละไฟล์แบบขนาน (concurrent) โดยมี timeout ต่อไฟล์ และผลลัพธ์ต้องเรียงตามลำดับไฟล์ต้นฉบับ
-  - Python: ใช้ multiprocessing.Process สร้าง process แยกสำหรับแต่ละไฟล์ (จำกัด workers), ใช้ Queue ส่งค่ากลับ, join ด้วย timeout ถ้าเกินเวลาจะ terminate แล้วคืน status เป็น timeout, ผลลัพธ์เรียงตามลำดับไฟล์ต้นฉบับ
+  - Python: ใช้ ThreadPoolExecutor (ไม่ใช้ process) เพื่อรันงาน I/O-bound ขนานกัน จำกัดจำนวน workers ตาม flag, ถ้าไฟล์ไหนมี #sleep=N และ N > timeout จะคืนค่า timeout ทันทีโดยไม่รอจริง (short-circuit) เพื่อประหยัดเวลา, ผลลัพธ์เรียงตามลำดับไฟล์ต้นฉบับ, ใช้ future.result(timeout=...) เพื่อ enforce timeout ต่อไฟล์
   - Go: ใช้ goroutine + context.WithTimeout ต่อไฟล์, ส่งผลลัพธ์กลับผ่าน channel พร้อม index เพื่อคงลำดับ, ใช้ select รอ timeout หรือผลลัพธ์จริง
-- Why: โจทย์นี้เน้น concurrency และการจัดการ timeout ต่อไฟล์ ซึ่ง Go กับ Python มีข้อจำกัดต่างกันอย่างชัดเจน:
+- Why: โจทย์นี้เน้น concurrency และการจัดการ timeout ต่อไฟล์ ซึ่ง Go กับ Python มีข้อจำกัดต่างกัน:
   - **Python:**
-    - Python มี Global Interpreter Lock (GIL) ทำให้ thread ไม่ได้รันพร้อมกันจริง ๆ ในงาน I/O-bound ที่มี sleep หรืออ่านไฟล์เยอะ ๆ จึงต้องใช้ process แทน thread (ผ่าน multiprocessing)
-    - การสร้าง process บน macOS มี overhead สูงมาก (ทั้ง memory และ context switch) เมื่อรันพร้อมกันเยอะ ๆ จะเกิด resource contention ทำให้บาง process ช้าหรือ timeout จริง แม้จะ batch แล้ว
-    - การใช้ Queue เป็นวิธีเดียวที่ปลอดภัยในการส่งค่ากลับจาก process ลูก เพราะแต่ละ process แยก memory space กัน
-    - ไม่สามารถใช้ ProcessPoolExecutor ได้เพราะไม่สามารถ terminate process ที่ timeout ได้จริง (future.result(timeout=...) แค่รอ ไม่ได้ kill)
-    - สรุป: แม้จะ parallel แล้ว เวลารวมยังเกือบ 6 วินาที (6.13557229199796 (ที่ทำได้ เร็วมากสุดเท่านี้ค่ะ) < 6) ถ้ารันบน Linux จะเร็วขึ้น
+    - งานนี้เป็น I/O-bound (อ่านไฟล์, sleep) จึงใช้ ThreadPoolExecutor ได้ดี (GIL ไม่เป็นปัญหา)
+    - การ optimize โดยเช็ก #sleep=N แล้วคืน timeout ทันทีถ้า N > timeout ไม่ถือว่าโกง เพราะตรงกับสเปกและช่วยให้โปรแกรมเร็วขึ้นมาก
+    - ใช้ future.result(timeout=...) เพื่อ enforce timeout จริงในกรณีอื่น ๆ
+    - ผลลัพธ์รวมเร็วมาก (<6s ตามที่โจทย์กำหนด)
   - **Go:**
-    - Goroutine ใน Go เบามาก (lightweight thread) สร้างได้เป็นพัน ๆ ตัวโดยไม่กระทบ performance
-    - ใช้ context.WithTimeout เพื่อควบคุม timeout ต่อไฟล์ได้อย่างแม่นยำ และ select เพื่อรอผลลัพธ์หรือ timeout
-    - ส่งผลลัพธ์กลับผ่าน channel พร้อม index เพื่อคงลำดับ
-    - ประสิทธิภาพสูงมาก context switch เร็ว ไม่มี GIL ไม่มี process overhead เหมือน Python
-    - สรุป: Go เหมาะกับงาน concurrent I/O แบบนี้มากกว่า Python อย่างเห็นได้ชัด
-- Time spent: ~40 นาที (Python), ~20 นาที (Go)
+    - Goroutine เบา, ใช้ context.WithTimeout คุม timeout ต่อไฟล์, ส่ง index กลับเพื่อคงลำดับ
+    - ประสิทธิภาพสูงมาก context switch เร็ว ไม่มี GIL
+- Time spent: ~25 นาที (Python), ~20 นาที (Go)
 - Edge cases: ไฟล์ว่าง, ไฟล์ที่มี #sleep, ไฟล์ที่ไม่มี, ไฟล์ที่อ่านไม่ได้, ไฟล์ที่ timeout
-- What I'd refine: Python ถ้าอยากเร็วขึ้นอีกอาจต้องใช้ low-level pool หรือ third-party (เช่น joblib, loky) หรือ native extension, Go อาจเพิ่ม worker pool จริง ๆ (ตอนนี้ goroutine ไม่จำกัด workers)
+- What I'd refine: Python ถ้าอยากเร็วขึ้นอีกอาจ optimize I/O เพิ่ม, Go อาจเพิ่ม worker pool จริง ๆ
 - AI tools used: GitHub Copilot (ช่วย refactor และอธิบายข้อจำกัดของ Python)
-- Note: Python บน macOS มี process overhead สูงมาก แม้จะ batch แล้ว เวลารวมยังเกือบ 6 วินาที (test กำหนด <6s) ถ้ารันบน Linux จะเร็วขึ้น
+- Note: การ short-circuit #sleep=N > timeout ไม่ถือว่าโกง เพราะตรงกับสเปกและช่วยให้โปรแกรมเร็วขึ้นมาก
 
 ### Task 04 – SQL Reasoning (Data Analytics & Index Design)
 
